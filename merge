@@ -1,0 +1,1056 @@
+
+
+
+
+import os
+#import csv
+import math
+import time
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional
+from types import SimpleNamespace
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import cv2
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from torchvision.models import resnet50, ResNet50_Weights
+from ultralytics import YOLO
+from scipy.optimize import linear_sum_assignment
+
+
+
+
+
+
+
+
+# Motor Control Libraries
+from adafruit_servokit import ServoKit
+from gpiozero import Motor
+
+
+
+
+
+
+
+
+# ============================================================================
+# [SECTION 1] Configuration & Constants
+# ============================================================================
+
+
+
+
+
+
+
+
+# --- Vision Settings ---
+MODEL_PATH  = r"/home/pi/Downloads/slippers4/last.pt"
+#OUT_CSV     = r"/home/pi/Downloads/Viz/match_results.csv"
+OUT_VIZ_DIR = r"/home/pi/Downloads/Viz"
+
+
+
+
+
+
+CONF_MIN = 0.60
+IMG_SIZE = 800
+IOU_NMS  = 0.60
+ORIENT_NORMALIZE = True
+SIM_MIN = 0.20
+USE_PERSPECTIVE_CROP = True
+USE_HUNGARIAN = True
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+
+
+
+
+
+
+MAX_HOLE_DIST_SQ = 200 ** 2
+
+
+
+
+
+
+
+
+USE_ROI_CROP = True  
+ROI_X1 = 479   # Left
+ROI_Y1 = 117   # Top
+ROI_X2 = 1271  # Right
+ROI_Y2 = 621   # Bottom
+
+
+
+
+
+
+
+
+
+
+# --- Kinematics Constants (mm) ---
+AX, AY = 0, 3846       # Winch anchor point
+BX, BY = 0, 1025.6         # Shoulder joint rotation axis
+L1 = 5833                  # Link 1 length
+L2 = 5256                  # Link 2 length
+FY_CONST = 416.6             # Fixed Target Height (y) - 필요 시 매개변수화 가능
+#119.5mm를 좌표 상 거리 766으로 환산해야해
+REF_AX, REF_AZ = 1176, 245.3   # Base rotation pivot point
+EPSILON = 1e-6              # Small value to prevent division by zero
+
+
+
+
+
+
+
+
+# --- Motor Hardware Constants ---
+SERVO_MAP = {
+    's1': 0, 's2': 1, 's3': 2, 's4': 3,
+    's5': 4, 's6': 5, 's7': 6
+}
+
+
+
+
+
+
+
+
+# Kinematic Speed Constants
+SERVO_SEC_PER_DEG = 0.16 / 60.0
+SPOOL_RADIUS_MM = 64  
+SPOOL_CIRCUMFERENCE_MM = 2 * math.pi * SPOOL_RADIUS_MM
+DC_RPM = 57.296
+DC_SPPEED_PIX_PER_SEC = (SPOOL_CIRCUMFERENCE_MM * (DC_RPM / 60.0))
+
+
+
+
+
+
+# ============================================================================
+# [SECTION 2] Hardware Initialization
+# ============================================================================
+
+
+
+
+
+
+
+
+# 1. Vision Hardware
+torch.set_grad_enabled(False)
+print("Loading Vision Models...")
+yolo = YOLO(MODEL_PATH)
+try:
+    resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+except Exception:
+    resnet = resnet50(weights=None)
+resnet.fc = nn.Identity()
+resnet.eval().to(DEVICE)
+
+
+
+
+
+
+
+
+transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+])
+
+
+
+
+
+
+
+
+# 2. Motor Hardware
+print("Initializing Motors...")
+try:
+    kit = ServoKit(channels=16)
+except Exception as e:
+    print(f"Warning: ServoKit init failed (I2C check needed): {e}")
+    kit = None
+
+
+
+
+
+
+
+
+# DC Motor Pin Setup (L298N)
+# d1: Winch for Arm (Group 3), d2: Synchro Winch (Group 1)
+motor_d1 = Motor(forward=17, backward=18, pwm=True)
+motor_d2 = Motor(forward=23, backward=24, pwm=True)
+
+
+
+
+
+
+
+
+# State Management (Global)
+current_state = {
+    's1': 90.0, 's2': 120.0, 's3': 60.0, 's4': 116.46,
+    's5': 63.54, 's6': 90.0, 's7': 90.0,
+    'd1': 81.0,
+    'd2': 0.0
+}
+zero_state = current_state.copy()
+
+
+
+
+
+
+
+
+# ============================================================================
+# [SECTION 3] Helper Functions
+# ============================================================================
+
+
+
+
+
+
+
+
+# --- 3.1 Vision Helpers ---
+def resolve_class_ids(yolo_model, left_key='left', right_key='right', hole_key='hold'):
+    """
+    YOLO 모델의 클래스 이름에서 ID를 찾습니다.
+    학습된 모델이 'hold'를 사용하므로 기본값(default)을 'hold'로 설정했습니다.
+    """
+    names = yolo_model.model.names if hasattr(yolo_model.model, 'names') else {}
+    norm = {str(v).replace(' ', '').lower(): int(k) for k, v in names.items()}
+    lk, rk, hk = left_key.replace(' ', '').lower(), right_key.replace(' ', '').lower(), hole_key.replace(' ', '').lower()
+    return names, norm.get(lk), norm.get(rk), norm.get(hk, -999)
+
+
+
+
+
+
+
+
+# [수정 완료] 모델 학습명인 'hold'를 사용하여 ID를 조회합니다.
+names, LEFT_ID, RIGHT_ID, HOLE_ID = resolve_class_ids(yolo, 'left', 'right', 'hold')
+
+
+
+
+
+
+
+
+def obb_corners_from_xywhr(cx, cy, w, h, theta_rad):
+    ct, st = math.cos(theta_rad), math.sin(theta_rad)
+    dx, dy = w/2.0, h/2.0
+    pts = [(-dx,-dy),(dx,-dy),(dx,dy),(-dx,dy)]
+    out=[]
+    for x,y in pts:
+        xr = x*ct - y*st + cx
+        yr = x*st + y*ct + cy
+        out.append((float(xr), float(yr)))
+    return out
+
+
+
+
+
+
+
+
+def clip_box(x1, y1, x2, y2, W, H):
+    return int(max(0, x1)), int(max(0, y1)), int(min(W-1, x2)), int(min(H-1, y2))
+
+
+
+
+
+
+
+
+def obb_rotated_crop(pil_img, cx, cy, w, h, theta_rad):
+    img = np.array(pil_img.convert("RGB"))
+    H, W = img.shape[:2]
+    M = cv2.getRotationMatrix2D((cx, cy), np.degrees(theta_rad), 1.0)
+    rotated = cv2.warpAffine(img, M, (W, H))
+    x1, y1, x2, y2 = clip_box(cx - w/2, cy - h/2, cx + w/2, cy + h/2, W, H)
+    crop = rotated[y1:y2, x1:x2]
+    return Image.fromarray(crop) if crop.size > 0 else None
+
+
+
+
+
+
+
+
+def order_corners_quad(pts):
+    pts = np.array(pts, dtype=np.float32)
+    c = np.mean(pts, axis=0)
+    angles = np.arctan2(pts[:,1]-c[1], pts[:,0]-c[0])
+    order = np.argsort(angles)
+    pts = pts[order]
+    s = pts.sum(axis=1)
+    top_left_idx = np.argmin(s)
+    return np.roll(pts, -top_left_idx, axis=0)
+
+
+
+
+
+
+
+
+def obb_warped_crop(pil_img, corners, out_size=224):
+    img = np.array(pil_img.convert("RGB"))
+    src = order_corners_quad(corners)
+    dst = np.array([[0,0],[out_size-1,0],[out_size-1,out_size-1],[0,out_size-1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(src, dst)
+    return Image.fromarray(cv2.warpPerspective(img, M, (out_size, out_size)))
+
+
+
+
+
+
+
+
+def dist_sq(p1, p2):
+    return (p1[0]-p2[0])**2 + (p1[1]-p2[1])**2
+
+
+
+
+
+
+
+
+def assign_holes_to_shoes(shoes_list, holes_list):
+    if not shoes_list or not holes_list: return
+    cost_matrix = np.zeros((len(shoes_list), len(holes_list)))
+    for i, shoe in enumerate(shoes_list):
+        for j, hole in enumerate(holes_list):
+            cost_matrix[i, j] = dist_sq((shoe['cx'], shoe['cy']), (hole['cx'], hole['cy']))
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    for r, c in zip(row_ind, col_ind):
+        if cost_matrix[r, c] <= MAX_HOLE_DIST_SQ:
+            shoes_list[r]['hole'] = holes_list[c]
+
+
+
+
+
+
+
+
+def calculate_shoe_vector(shoe_data):
+    fx, fz = shoe_data['gx'], shoe_data['gy']
+    vec = 0.0
+    if shoe_data['hole']:
+        dx = shoe_data['hole']['gx'] - fx
+        dy = shoe_data['hole']['gy'] - fz
+        vec = math.atan2(dy, dx)
+    return fx, fz, vec
+
+
+
+
+
+
+
+
+def get_feature_batch(crops, resnet_model, transform, device):
+    if len(crops) == 0: return np.zeros((0, 2048), dtype=np.float32)
+    with torch.inference_mode():
+        batch = torch.stack([transform(c.convert("RGB")) for c in crops]).to(device)
+        vecs = resnet_model(batch).detach().cpu().numpy()
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8
+    return (vecs / norms).astype(np.float32)
+
+
+
+
+
+
+
+
+def robust_match(sim, use_hungarian=True):
+    if sim.size == 0: return []
+    if use_hungarian:
+        r_idx, c_idx = linear_sum_assignment(1.0 - sim)
+        pairs = [(int(r), int(c), float(sim[r, c])) for r, c in zip(r_idx, c_idx)]
+    else:
+        pairs, used_cols = [], set()
+        for i in range(sim.shape[0]):
+            order = np.argsort(-sim[i])
+            j = next((int(jj) for jj in order if sim[i, jj] > 0 and jj not in used_cols), None)
+            if j is not None:
+                used_cols.add(j)
+                pairs.append((i, j, float(sim[i, j])))
+    return [(i, j, sc) for (i, j, sc) in pairs if sc >= SIM_MIN]
+
+
+
+
+
+
+
+
+def load_font():
+    f = ImageFont.load_default()
+    try:
+        return ImageFont.truetype("arial.ttf", 20), ImageFont.truetype("arial.ttf", 18)
+    except:
+        return f, f
+
+
+
+
+
+
+
+
+# --- 3.2 Kinematics Logic ---
+@dataclass
+class KinematicsResult:
+    theta0: float
+    vec: float
+    L4: float
+    theta2prime: float
+    theta4: float
+
+
+
+
+
+
+
+
+def calculate_kinematics_data(fx: float, fz: float, vec: float) -> Optional[KinematicsResult]:
+    # Step 1: Base Rotation
+    dx_base = fx - REF_AX
+    dz_base = fz - REF_AZ
+    theta0_rad = math.atan2(dx_base, dz_base)
+    theta0 = math.degrees(theta0_rad)
+
+
+
+
+
+
+
+
+    # Step 2: 3D to 2D
+    horizontal_dist = math.sqrt(dx_base**2 + dz_base**2)
+    target_r = horizontal_dist
+    target_y = FY_CONST
+
+
+
+
+
+
+
+
+    # Step 3: Planar IK
+    dist_x = BX - target_r
+    dist_y = BY - target_y
+    L3 = math.sqrt(dist_x**2 + dist_y**2)
+
+
+
+
+
+
+
+
+    if L3 > (L1 + L2) or L3 < abs(L1 - L2) or L3 == 0:
+        return None
+
+
+
+
+
+
+
+
+    try:
+        cos_th4 = (L1**2 + L2**2 - L3**2) / (2 * L1 * L2)
+        cos_th4 = max(-1.0, min(1.0, cos_th4))
+        th4_rad = math.acos(cos_th4)
+
+
+
+
+
+
+
+
+        beta = math.atan2(dist_y, dist_x)
+        cos_alpha = (L3**2 + L1**2 - L2**2) / (2 * L3 * L1)
+        cos_alpha = max(-1.0, min(1.0, cos_alpha))
+        alpha = math.acos(cos_alpha)
+
+
+
+
+
+
+
+
+        th2_prime_rad = beta - alpha
+
+
+
+
+
+
+
+
+        p1_x = BX - L1 * math.cos(th2_prime_rad)
+        p1_y = BY - L1 * math.sin(th2_prime_rad)
+        L4 = math.sqrt((AX - p1_x)**2 + (AY - p1_y)**2)
+
+
+
+
+
+
+
+
+    except ValueError:
+        return None
+
+
+
+
+
+
+
+
+    return KinematicsResult(
+        theta0=theta0,
+        vec=vec,
+        L4=L4,
+        theta2prime=math.degrees(th2_prime_rad),
+        theta4=math.degrees(th4_rad)
+    )
+
+
+
+
+
+
+
+
+# --- 3.3 Motor Control Logic ---
+def _execute_motion(servo_targets, dc_motor=None, dc_target_len=None, dc_current_len_key=None):
+    if kit is None: return
+   
+    # 1. Calc Servo Time
+    max_servo_time = 0
+    for name, target_angle in servo_targets.items():
+        curr_angle = current_state[name]
+        needed_time = abs(target_angle - curr_angle) * SERVO_SEC_PER_DEG
+        if needed_time > max_servo_time: max_servo_time = needed_time
+
+
+
+
+
+
+
+
+    # 2. Calc DC Time
+    dc_time, diff_len = 0, 0
+    if dc_motor and dc_target_len is not None:
+        curr_len = current_state[dc_current_len_key]
+        diff_len = dc_target_len - curr_len
+        dc_time = abs(diff_len) / DC_SPPEED_PIX_PER_SEC
+    
+
+
+
+
+
+
+
+
+    # 3. Total Duration
+    total_duration = max(max_servo_time, dc_time)
+    if total_duration < 0.1: total_duration = 0.1
+
+
+
+
+
+
+
+
+    # 4. DC PWM
+    dc_pwm, actual_dc_run_time = 0, 0
+    if dc_motor and dc_time > 0:
+        ratio = dc_time / total_duration
+        dc_pwm = min(max(ratio, 0.0), 1.0)
+        actual_dc_run_time = total_duration
+
+
+
+
+
+
+
+
+    print(f"Motion: {total_duration:.2f}s (DC PWM: {dc_pwm:.2f})")
+
+
+
+
+
+
+
+
+    # Execution
+    if dc_motor and abs(diff_len) > 0.01:
+        dc_motor.forward(speed=dc_pwm) if diff_len > 0 else dc_motor.backward(speed=dc_pwm)
+
+
+
+
+
+
+
+
+    for name, target_angle in servo_targets.items():
+        safe_angle = max(0, min(180, target_angle))
+        kit.servo[SERVO_MAP[name]].angle = safe_angle
+        current_state[name] = safe_angle
+
+
+
+
+
+
+
+
+    if actual_dc_run_time < total_duration:
+        time.sleep(actual_dc_run_time)
+        if dc_motor: dc_motor.stop()
+        time.sleep(total_duration - actual_dc_run_time)
+    else:
+        time.sleep(total_duration)
+        if dc_motor: dc_motor.stop()
+   
+    if dc_target_len is not None:
+        current_state[dc_current_len_key] = dc_target_len
+
+
+
+
+
+
+
+
+def move_group_s1_d2(target_angle_s1):
+    delta_angle = target_angle_s1 - current_state['s1']
+    spool_radius_cm = SPOOL_RADIUS_MM / 10.0
+    delta_len_cm = (2 * math.pi * spool_radius_cm) * (delta_angle / 360.0)
+    target_len_d2 = current_state['d2'] + delta_len_cm
+   
+    print(f"[G1] s1:{target_angle_s1:.1f}, d2:{target_len_d2:.2f}")
+    _execute_motion({'s1': target_angle_s1}, motor_d2, target_len_d2, 'd2')
+
+
+
+
+
+
+
+
+def move_group_s2_s3(target_angle_s2, target_angle_s3):
+    print(f"[G2] s2:{target_angle_s2:.1f}, s3:{target_angle_s3:.1f}")
+    _execute_motion({'s2': target_angle_s2, 's3': target_angle_s3})
+
+
+
+
+
+
+
+
+def move_group_s4_s5_d1(target_angle_s4, target_angle_s5, target_len_d1_cm):
+    print(f"[G3] s4:{target_angle_s4:.1f}, s5:{target_angle_s5:.1f}, d1:{target_len_d1_cm:.2f}")
+    _execute_motion({'s4': target_angle_s4, 's5': target_angle_s5}, motor_d1, target_len_d1_cm, 'd1')
+
+
+
+
+
+
+
+
+def move_group_s6(target_angle_s6):
+    print(f"[G4] s6:{target_angle_s6:.1f}")
+    _execute_motion({'s6': target_angle_s6})
+
+
+
+
+
+
+
+
+def move_group_s7(target_angle_s7):
+    print(f"[G5] s7:{target_angle_s7:.1f}")
+    _execute_motion({'s7': target_angle_s7})
+
+
+
+
+
+
+
+
+def reset_to_zero():
+    print(">>> Returning to INITIAL STATE...")
+    move_group_s7(zero_state['s7'])
+    move_group_s4_s5_d1(zero_state['s4'], zero_state['s5'], zero_state['d1'])
+    move_group_s2_s3(zero_state['s2'], zero_state['s3'])
+    move_group_s1_d2(zero_state['s1'])
+    move_group_s6(zero_state['s6']) # Reset gripper
+
+
+
+
+
+
+
+
+def execute_robot_task_sequence(kin: KinematicsResult):
+    print(f"\n>>> Executing Sequence for Theta0: {kin.theta0:.2f}")
+   
+    # 1. Base Rotation
+    move_group_s1_d2(target_angle_s1=kin.theta0)
+    time.sleep(0.5)
+
+
+
+
+
+
+
+
+    # 2. Shoulder
+    move_group_s2_s3(target_angle_s2=180 - kin.theta2prime, target_angle_s3=kin.theta2prime)
+    time.sleep(0.5)
+
+
+
+
+
+
+
+
+    # 3. Elbow & Arm Extension
+    move_group_s4_s5_d1(target_angle_s4=180 - kin.theta4, target_angle_s5=kin.theta4, target_len_d1_cm=kin.L4)
+    time.sleep(0.5)
+
+
+
+
+
+
+
+
+    # 4. End Effector Orient
+    vec_deg = math.degrees(kin.vec)
+    move_group_s7(target_angle_s7=vec_deg)
+   
+    # 5. Gripper Action
+    move_group_s6(target_angle_s6=100)
+    time.sleep(0.5)
+   
+    # 6. Reset (Grip and Return)
+    # move_group_s6(0) # 필요시 그리퍼를 다시 풀거나 유지
+    time.sleep(0.5)
+    reset_to_zero()
+
+
+
+
+
+
+
+
+# ============================================================================
+# [SECTION 4] Main Loop
+# ============================================================================
+
+
+
+
+
+
+
+
+def main():
+    if kit: reset_to_zero()
+   
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+
+
+
+
+
+
+
+    #csv_header = (
+        #"filename", "similarity",
+        #"R_id", "R_conf", "R_fx", "R_fz", "R_vec",
+        #"L_id", "L_conf", "L_fx", "L_fz", "L_vec",
+        #"R_w", "R_h", "R_r", "L_w", "L_h", "L_r"
+    #)
+   
+    #file_exists = os.path.isfile(OUT_CSV)
+    #if not file_exists:
+        #with open(OUT_CSV, "a", newline="", encoding="utf-8") as f:
+            #csv.writer(f).writerow(csv_header)
+
+
+
+
+
+
+
+
+    num = 1
+    font, font_small = load_font()
+
+
+
+
+
+
+
+
+    print("\n=== READY ===")
+    print(" [c] Capture -> Process -> Move Robot")
+    print(" [q] Quit")
+   
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+
+
+
+
+
+
+
+
+            vis_frame = frame.copy()
+            if USE_ROI_CROP:
+                cv2.rectangle(vis_frame, (ROI_X1, ROI_Y1), (ROI_X2, ROI_Y2), (0, 255, 0), 2)
+                cv2.putText(vis_frame, "ROI", (ROI_X1, ROI_Y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+           
+            cv2.imshow('Webcam', vis_frame)
+            key = cv2.waitKey(1) & 0xFF
+
+
+
+
+
+
+
+
+            if key == ord('q'):
+                break
+           
+            elif key == ord('c'):
+                # -------------------------
+                # 1. Vision Processing
+                # -------------------------
+                if USE_ROI_CROP:
+                    h, w = frame.shape[:2]
+                    x1, y1 = max(0, ROI_X1), max(0, ROI_Y1)
+                    x2, y2 = min(w, ROI_X2), min(h, ROI_Y2)
+                    process_frame = frame[y1:y2, x1:x2].copy()
+                    offset_x, offset_y = x1, y1
+                else:
+                    process_frame = frame.copy()
+                    offset_x, offset_y = 0, 0
+               
+                if process_frame.size == 0: continue
+               
+                pil_img = Image.fromarray(cv2.cvtColor(process_frame, cv2.COLOR_BGR2RGB))
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                fname = f"capture_{num}_{ts}"
+                print(f"\n--- Processing {fname} ---")
+
+
+
+
+
+
+
+
+                # YOLO Predict
+                res = yolo.predict(process_frame, conf=CONF_MIN, imgsz=IMG_SIZE, iou=IOU_NMS, verbose=False)[0]
+                if getattr(res, "obb", None) is None or len(res.obb) == 0:
+                    print("No detections.")
+                    continue
+
+
+
+
+
+
+
+
+                xywhr = res.obb.xywhr.detach().cpu().numpy()
+                cls_ids = res.obb.cls.detach().cpu().numpy().astype(int)
+                confs = res.obb.conf.detach().cpu().numpy()
+               
+                shoes_r, shoes_l, holes = [], [], []
+
+
+
+
+
+
+
+
+                for k, (c, cf, obb) in enumerate(zip(cls_ids, confs, xywhr)):
+                    if cf < CONF_MIN: continue
+                    cx, cy, w, h, th = map(float, obb)
+                    corners = obb_corners_from_xywhr(cx, cy, w, h, th)
+                    gx, gy = cx + offset_x, cy + offset_y
+                   
+                    item_data = {
+                        'obb': (cx, cy, w, h, th), 'corners': corners,
+                        'cx': cx, 'cy': cy, 'gx': gx, 'gy': gy, 'conf': float(cf),
+                        'id': k, 'hole': None, 'crop': None
+                    }
+
+
+
+
+
+
+
+
+                    if c == RIGHT_ID or c == LEFT_ID:
+                        crop = obb_warped_crop(pil_img, corners) if USE_PERSPECTIVE_CROP else obb_rotated_crop(pil_img, cx, cy, w, h, th)
+                        if crop:
+                            if ORIENT_NORMALIZE: crop = crop.transpose(Image.FLIP_LEFT_RIGHT)
+                            item_data['crop'] = crop
+                            if c == RIGHT_ID: shoes_r.append(item_data)
+                            else: shoes_l.append(item_data)
+                    # [수정 완료] 모델의 ID(HOLD_ID)와 비교하여, 내부 리스트(holes)에 저장
+                    elif c == HOLE_ID:
+                        holes.append(item_data)
+
+
+
+
+
+
+
+
+                # Matching & Processing
+                assign_holes_to_shoes(shoes_r + shoes_l, holes)
+                pairs = []
+                if len(shoes_r) > 0 and len(shoes_l) > 0:
+                    R_feats = get_feature_batch([s['crop'] for s in shoes_r], resnet, transform, DEVICE)
+                    L_feats = get_feature_batch([s['crop'] for s in shoes_l], resnet, transform, DEVICE)
+                    S_mat = R_feats @ L_feats.T
+                    for ri, li, sc in robust_match(S_mat, USE_HUNGARIAN):
+                        pairs.append((shoes_r[ri], shoes_l[li], sc))
+               
+                base = pil_img.copy()
+                draw = ImageDraw.Draw(base)
+               
+                for s_r, s_l, sc in pairs:
+                    draw.line([(s_r['cx'], s_r['cy']), (s_l['cx'], s_l['cy'])], fill=(255,255,0), width=3)
+                   
+                    r_fx, r_fz, r_vec = calculate_shoe_vector(s_r)
+                    l_fx, l_fz, l_vec = calculate_shoe_vector(s_l)
+                   
+                    #with open(OUT_CSV, "a", newline="", encoding="utf-8") as f:
+                        #csv.writer(f).writerow([
+                            #fname, round(sc, 4),
+                            #s_r['id'], round(s_r['conf'],3), round(r_fx,1), round(r_fz,1), round(r_vec,4),
+                            #s_l['id'], round(s_l['conf'],3), round(l_fx,1), round(l_fz,1), round(l_vec,4),
+                            #0,0,0,0,0,0
+                        #])
+                   
+                    # -------------------------
+                    # 2. Kinematics & 3. Control
+                    # -------------------------
+                    print(f" -> Calculating Kinematics for Shoe R: ({r_fx}, {r_fz})")
+                    kin_res = calculate_kinematics_data(r_fx, r_fz, r_vec)
+                   
+                    if kin_res:
+                        print(" -> Kinematics Solved! Moving Robot...")
+                        execute_robot_task_sequence(kin_res)
+                    else:
+                        print(" -> Target Unreachable.")
+
+
+
+
+
+
+
+
+                base.save(os.path.join(OUT_VIZ_DIR, f"{fname}_annotated.jpg"))
+                num += 1
+
+
+
+
+
+
+
+
+    except KeyboardInterrupt:
+        print("Stopping...")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        motor_d1.close()
+        motor_d2.close()
+        print("Done.")
+
+
+if __name__ == "__main__":
+    main()
